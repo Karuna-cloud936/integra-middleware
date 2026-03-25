@@ -1,7 +1,104 @@
 from flask import Flask, request, jsonify, send_file, render_template
 import openpyxl
 from openpyxl import Workbook
-import os, io, math
+import os, io, math, requests, zipfile, re
+
+FULCRUM_SESSION = os.environ.get('FULCRUM_SESSION', '')
+FULCRUM_BASE = 'https://integrasystems.fulcrumpro.com/api'
+
+def fulcrum_headers():
+    return {
+        'Cookie': f'fp-auth-token-integrasystems={FULCRUM_SESSION}',
+        'Content-Type': 'application/json',
+        'Accept': 'application/json'
+    }
+
+def fulcrum_upload_headers():
+    return {
+        'Cookie': f'fp-auth-token-integrasystems={FULCRUM_SESSION}',
+        'Accept': 'application/json'
+    }
+
+def get_existing_item(part_number):
+    """Returns (fulcrum_id, []) or (None, []) if not found. Uses cached lookup table."""
+    return item_id_cache.get(part_number.upper(), (None, []))
+
+def build_item_id_cache(top_assembly_id):
+    """Fetch assembly from Fulcrum and build part number -> ID cache."""
+    if not FULCRUM_SESSION:
+        return {}
+    try:
+        r = requests.get(f'{FULCRUM_BASE}/items/{top_assembly_id}',
+            headers=fulcrum_headers(), timeout=10)
+        print(f'Fulcrum assembly fetch: HTTP {r.status_code}')
+        if r.status_code == 200:
+            data = r.json()
+            cache = {}
+            # Add the assembly itself
+            cache[data.get('number','').upper()] = (data.get('id'), [])
+            # Add all child parts from routing inputItems
+            routing = data.get('routing', {})
+            input_items = routing.get('inputItems', [])
+            for item in input_items:
+                ref = item.get('itemReference', {})
+                pn = ref.get('number', '').upper()
+                item_id = ref.get('id', '')
+                if pn and item_id:
+                    cache[pn] = (item_id, [])
+            print(f'Built cache with {len(cache)} parts: {list(cache.keys())}')
+            return cache
+    except Exception as e:
+        print(f'Fulcrum cache build error: {e}')
+    return {}
+
+
+def extract_attachments_from_zip(zip_bytes):
+    """Extract PDFs and SLDPRTs from SolidWorks zip, return {part_number: [filename, bytes]}"""
+    attachments = {}
+    try:
+        with zipfile.ZipFile(io.BytesIO(zip_bytes)) as z:
+            for name in z.namelist():
+                basename = os.path.basename(name)
+                if not basename: continue
+                ext = os.path.splitext(basename)[1].lower()
+                if ext not in ['.pdf', '.sldprt', '.sldasm', '.step', '.stp']:
+                    continue
+                stem = os.path.splitext(basename)[0].upper()
+                # Strip revision suffix - revisions are trailing -00 to -99 or -R01 etc
+                # P-1234-07 → P-1234, A-0406-00 → A-0406, P-2575-R02 → P-2575
+                pn = re.sub(r'-[Rr]?[0-9]{1,2}$', '', stem)
+                if pn not in attachments:
+                    attachments[pn] = []
+                attachments[pn].append((basename, z.read(name)))
+    except Exception as e:
+        print(f'Zip extraction error: {e}')
+    return attachments
+
+def find_xlsx_in_zip(zip_bytes):
+    """Find and return the BOM xlsx from inside the zip"""
+    try:
+        with zipfile.ZipFile(io.BytesIO(zip_bytes)) as z:
+            for name in z.namelist():
+                basename = os.path.basename(name)
+                if basename.endswith('.xlsx') and not basename.startswith('~'):
+                    return basename, z.read(name)
+    except Exception as e:
+        print(f'Zip xlsx error: {e}')
+    return None, None
+
+def build_attachment_zip(assembly_number, attachments, parts):
+    """Build a zip in SolidWorks format with all matched attachments"""
+    buf = io.BytesIO()
+    part_numbers = set(p['pn'].upper() for p in parts)
+    part_numbers.add(assembly_number.upper())
+    with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as z:
+        for pn, files in attachments.items():
+            # Include if part number matches any part in BOM
+            if any(pn.startswith(p) or p.startswith(pn) or pn == p for p in part_numbers):
+                for filename, data in files:
+                    z.writestr(f'{assembly_number}/{filename}', data)
+    buf.seek(0)
+    return buf
 
 SPEED_TABLE = {
     'steel': {0.5:125,0.75:125,0.9:125,1.0:125,1.1:125,1.2:125,1.5:125,1.6:125,2.0:90,2.5:32,3.0:32,4.0:25,5.0:21,6.0:18,8.0:14,10.0:11},
@@ -29,7 +126,6 @@ PC_COLOURS = [
     'PC-Trim Black replacement'
 ]
 
-# Map colour name from SolidWorks BOM → PC item name
 COLOUR_MAP = {c.lower().replace('pc-','').replace('pc- ','').strip(): c for c in PC_COLOURS}
 
 def match_colour(raw_colour):
@@ -70,7 +166,7 @@ FULCRUM_OP_MAP = {
     'laser cutting':'Laser Cutting','lasercut':'Laser Cutting','laser cut':'Laser Cutting',
     'press brake bending':'Press Brake Bending','press brake':'Press Brake Bending',
     'panel bending':'Panel Bending',
-    'laser welding':'Outsourced Welding',
+    'laser welding':'Laser Welding',
     'powdercoating':'Powder Coating','powder coating':'Powder Coating','powdercoat':'Powder Coating',
     'assembly':'Assembly','clinching':'Clinching','3d printing':'3D Printing',
     'outside processing':'Outsourced Fabrication','outsourced fabrication':'Outsourced Fabrication',
@@ -105,6 +201,7 @@ ALL_SHEETS = ['Directions','Reference Data','Items','Material Items',
     'Routing','Price Breaks','Inventory','Sales UOMs','Item Inventory']
 
 sessions = {}
+item_id_cache = {}
 
 def clean(v):
     if v is None: return ''
@@ -135,12 +232,11 @@ def parse_bom(file_bytes):
     pending_pn = None
 
     for i, row in enumerate(rows):
-        if i == 0: continue  # skip header
+        if i == 0: continue
 
         pn_raw = row[1]
         pn = str(pn_raw).strip() if pn_raw else ''
 
-        # Sheet row (no part number, has X/Y data)
         if not pn and pending_pn and row[14] is not None:
             x, y = row[14], row[15]
             bends = float(row[16]) if is_numeric(row[16]) else None
@@ -151,7 +247,6 @@ def parse_bom(file_bytes):
             labor[pending_pn]['bends'] = bends
             labor[pending_pn]['outer'] = outer
             labor[pending_pn]['inner'] = inner
-            # auto speed
             p = next((p for p in parts if p['pn'] == pending_pn), None)
             if p and not labor[pending_pn]['speed']:
                 labor[pending_pn]['speed'] = get_cutting_speed(p['mat'], p['thick'])
@@ -169,16 +264,13 @@ def parse_bom(file_bytes):
         try: qty = int(float(str(row[13]))) if row[13] else 1
         except: qty = 1
 
-        # Parse processes from columns 7-12
         procs = []
         for col in range(7, 13):
             op = norm_proc(row[col])
             if op and op not in procs:
                 procs.append(op)
 
-        # Indent from item_no dots e.g. "1.2.3" = indent 2
         indent = item_no.count('.')
-
         has_procs = bool(procs)
         is_make = has_procs or (mat and not is_junk_mat(mat))
 
@@ -256,8 +348,18 @@ def upload():
     f = request.files['file']
     filename = f.filename
     file_bytes = f.read()
-    # Extract assembly number from filename e.g. A-3686_R3.xlsx → A-3686
-    top = filename.split('_')[0].strip()
+
+    # Handle zip file upload
+    attachments = {}
+    if filename.lower().endswith('.zip'):
+        attachments = extract_attachments_from_zip(file_bytes)
+        bom_filename, bom_bytes = find_xlsx_in_zip(file_bytes)
+        if not bom_bytes:
+            return jsonify({'error':'No xlsx found inside zip'}), 400
+        filename = bom_filename
+        file_bytes = bom_bytes
+
+    top = os.path.splitext(filename.split('_')[0].strip())[0]
 
     try:
         parts, labor = parse_bom(file_bytes)
@@ -265,7 +367,7 @@ def upload():
         return jsonify({'error': str(e)}), 500
 
     session_id = top
-    sessions[session_id] = {'parts':parts,'labor':labor,'top':top,'filename':filename}
+    sessions[session_id] = {'parts':parts,'labor':labor,'top':top,'filename':filename,'attachments':attachments}
 
     laser = [p for p in parts if 'Laser Cutting' in p['processes']]
     press = [p for p in parts if 'Press Brake Bending' in p['processes']]
@@ -273,10 +375,10 @@ def upload():
     powder = [p for p in parts if 'Powder Coating' in p['processes']]
 
     return jsonify({
-        'session_id': session_id, 'top': top, 'total': len(parts)+1,
+        'session_id': session_id, 'top': top, 'total': len(parts)+1, 'has_attachments': bool(attachments),
         'laser': [{'pn':p['pn'],'desc':p['desc'],'mat':p['mat'],'thick':p['thick'],
                    'outer':labor[p['pn']]['outer'],'inner':labor[p['pn']]['inner'],
-                   'speed':labor[p['pn']]['speed']} for p in laser],
+                   'speed':labor[p['pn']]['speed'],'x':labor[p['pn']]['x'],'y':labor[p['pn']]['y']} for p in laser],
         'press': [{'pn':p['pn'],'desc':p['desc'],'mat':p['mat'],'thick':p['thick'],
                    'bends':labor[p['pn']]['bends'],'spb':labor[p['pn']]['spb']} for p in press],
         'panel': [{'pn':p['pn'],'desc':p['desc'],'mat':p['mat'],'thick':p['thick'],
@@ -302,6 +404,19 @@ def update_labor():
                 result[op] = calc_labor(pn, op, sess['labor'])
     return jsonify({'pn':pn,'labor':result})
 
+@app.route('/download/attachments/<session_id>')
+def download_attachments(session_id):
+    if session_id not in sessions: return jsonify({'error':'Session not found'}), 404
+    sess = sessions[session_id]
+    attachments = sess.get('attachments', {})
+    parts = sess['parts']
+    top = sess['top']
+    if not attachments:
+        return jsonify({'error':'No attachments found'}), 404
+    buf = build_attachment_zip(top, attachments, parts)
+    return send_file(buf, as_attachment=True, download_name=f'{top}_attachments.zip',
+                     mimetype='application/zip')
+
 @app.route('/download/<step>/<session_id>')
 def download(step, session_id):
     if session_id not in sessions: return jsonify({'error':'Session not found'}), 404
@@ -309,26 +424,26 @@ def download(step, session_id):
     parts = sess['parts']; labor = sess['labor']; top = sess['top']
     seen, bom_rows = build_hierarchy(parts, top)
 
-    # Collect unique PC colours used
     used_colours = set()
     for p in parts:
         if 'Powder Coating' in p['processes'] and p['colour']:
             used_colours.add(p['colour'])
 
-    # Build items
+    # Build items - skip parts that already exist in Fulcrum
     item_data = [ITEM_COLS, irow(top, top+' Assembly', 'Make')]
     done = {top}
     for pn, p in seen.items():
         if pn in done: continue
         done.add(pn)
+        existing_id, _ = get_existing_item(pn)
+        if existing_id:
+            continue  # already exists in Fulcrum, skip
         item_data.append(irow(pn, p['desc'], p['origin'], p['mat'], p['thick']))
-    # Add PC colour items
     for pc in sorted(used_colours):
         item_data.append(pc_irow(pc))
 
     # Build BOM
     bom_data = [BOM_H] + [[r['parent'],'',r['child'],'',r['qty']] for r in bom_rows]
-    # Add PC colour as child of parts that use powder coating
     for p in parts:
         if 'Powder Coating' in p['processes'] and p['colour']:
             x = labor[p['pn']]['x']; y = labor[p['pn']]['y']
@@ -336,11 +451,15 @@ def download(step, session_id):
             if powder_kg:
                 bom_data.append([p['pn'], '', p['colour'], '', powder_kg])
 
-    # Build Routing
+    # Build Routing - skip ops that already exist in Fulcrum
     rout_data = [ROUT_H]
     for pn, p in seen.items():
         if p['origin'] == 'Buy' or not p['processes']: continue
+        _, existing_ops = get_existing_item(pn)
+        existing_ops_lower = [o.lower() for o in existing_ops]
         for i, op in enumerate(p['processes']):
+            if op.lower() in existing_ops_lower:
+                continue  # skip - already exists in Fulcrum
             lt = calc_labor(pn, op, labor)
             rout_data.append([
                 pn, '', op, (i+1)*10, '', '',
@@ -360,6 +479,83 @@ def download(step, session_id):
     wb.save(buf); buf.seek(0)
     return send_file(buf, as_attachment=True, download_name=fname,
                      mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+
+@app.route('/auto_attach/<session_id>', methods=['POST'])
+def auto_attach(session_id):
+    global item_id_cache
+    if session_id not in sessions:
+        return jsonify({'error': 'Session not found'}), 404
+    if not FULCRUM_SESSION:
+        return jsonify({'error': 'No FULCRUM_SESSION set — add it to your environment'}), 400
+
+    sess = sessions[session_id]
+    attachments = sess.get('attachments', {})
+    parts = sess['parts']
+    top = sess['top']
+
+    if not attachments:
+        return jsonify({'error': 'No attachments found in uploaded zip'}), 400
+
+    # Get assembly Fulcrum ID from request body
+    data = request.get_json(silent=True) or {}
+    assembly_fulcrum_id = data.get('assembly_id', '')
+    if assembly_fulcrum_id:
+        item_id_cache = build_item_id_cache(assembly_fulcrum_id)
+
+    part_numbers = set(p['pn'].upper() for p in parts)
+    part_numbers.add(top.upper())
+
+    results = []
+    attached = skipped = failed = 0
+
+    for pn, files in attachments.items():
+        # Find matching part number
+        matched_pn = None
+        for p in sorted(part_numbers, key=len, reverse=True):  # longest match first
+            if pn == p or pn.startswith(p) or p.startswith(pn):
+                matched_pn = p
+                break
+        if not matched_pn:
+            print(f'No match for {pn} in {part_numbers}')
+            continue
+
+        # Get Fulcrum item ID
+        item_id, _ = get_existing_item(matched_pn)
+        if not item_id:
+            for filename, _ in files:
+                results.append({'part': matched_pn, 'file': filename, 'success': False, 'error': 'Part not found in Fulcrum'})
+                failed += 1
+            continue
+
+        for filename, file_bytes in files:
+            try:
+                # Use correct Fulcrum attachments API: POST /api/attachments (multipart)
+                ext = os.path.splitext(filename)[1].lower()
+                mime = 'application/pdf' if ext == '.pdf' else 'application/octet-stream'
+                upload_resp = requests.post(
+                    f'{FULCRUM_BASE}/attachments',
+                    headers=fulcrum_upload_headers(),
+                    files={'File': (filename, file_bytes, mime)},
+                    data={
+                        'Detail.Owner.Type': 'item',
+                        'Detail.Owner.Id': item_id,
+                        'Detail.IsNoteAttachment': 'false',
+                        'Detail.Description': filename,
+                    },
+                    timeout=30
+                )
+                if upload_resp.status_code in [200, 201]:
+                    results.append({'part': matched_pn, 'file': filename, 'success': True})
+                    attached += 1
+                else:
+                    results.append({'part': matched_pn, 'file': filename, 'success': False, 'error': f'HTTP {upload_resp.status_code}: {upload_resp.text[:100]}'})
+                    failed += 1
+            except Exception as e:
+                results.append({'part': matched_pn, 'file': filename, 'success': False, 'error': str(e)})
+                failed += 1
+
+    return jsonify({'results': results, 'attached': attached, 'skipped': skipped, 'failed': failed})
+
 
 if __name__ == '__main__':
     app.run(debug=True, port=5050)
